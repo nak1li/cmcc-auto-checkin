@@ -37,3 +37,6 @@ scripts/install-launchd.sh
 *.bak-*
 config.json.bak*
 .patches/
+
+# 探针运行数据（非凭证，但属运行产物）
+.cmcc_app_token_probe.jsonl
