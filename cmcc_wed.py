@@ -81,10 +81,24 @@ def wed_api(s: requests.Session, referer: str, path: str, payload: dict | None =
     """调 wedrecharge API。本 hub 的成功码是字符串 "0"（区别于 qwhdhub 的 SUCCESS）。"""
     r = s.post(f"{API_WED}/{path}", json=payload or {}, headers=api_headers(referer), timeout=30)
     r.raise_for_status()
-    resp = r.json()
+    try:
+        resp = r.json()
+    except ValueError as e:
+        raise RuntimeError(
+            f"接口返回非 JSON: {path} HTTP {r.status_code} "
+            f"content-type={r.headers.get('Content-Type')} body={r.text[:200]!r}"
+        ) from e
+    # 2026-10-21 实测：上游偶发返回裸 JSON 字符串而非对象，此时 resp.get 会炸
+    # 'str' object has no attribute 'get'，报错看不出是哪个接口降级了。
+    if not isinstance(resp, dict):
+        raise RuntimeError(
+            f"接口返回非对象: {path} HTTP {r.status_code} "
+            f"type={type(resp).__name__} body={str(resp)[:200]!r}"
+        )
     if resp.get("code") != "0":
         raise RuntimeError(f"{path} 失败: {resp.get('code')} {resp.get('msg')}")
-    return resp.get("data") or {}
+    data = resp.get("data")
+    return data if isinstance(data, dict) else {}
 
 
 def puzzle_lines(state: dict) -> list[str]:

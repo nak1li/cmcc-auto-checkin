@@ -58,7 +58,7 @@ STOP_STATUSES = {
     "PRIZE_LIMIT_DAY": "当日中奖次数已用完",
     "PRIZE_LIMIT_MONTH": "当月中奖次数已用完",
     "PRIZE_RESTRIC_LIMIT": "活动期间中奖次数已达上限",
-    "WORK_ORDER_RESTRIC_LIMIT": "工单限流（黑名单/风控）",
+    "WORK_ORDER_RESTRIC_LIMIT": "已领取奖励，限领一次（业务终态）",
 }
 
 # 会话 cookie 滑动 30 分钟，长等时的心跳间隔（也顺带刷新 cookie）
@@ -69,14 +69,49 @@ def api_post(s, referer: str, url: str, payload: dict | None = None) -> dict:
     r = s.post(url, json=payload if payload is not None else {},
                headers=api_headers(referer), timeout=10)
     r.raise_for_status()
-    return r.json()
+    try:
+        data = r.json()
+    except ValueError as e:
+        raise RuntimeError(
+            f"接口返回非 JSON: {url} HTTP {r.status_code} "
+            f"content-type={r.headers.get('Content-Type')} body={r.text[:200]!r}"
+        ) from e
+    # 2026-10-21 实测：上游偶发返回裸 JSON 字符串（如 "系统繁忙"）而非对象，
+    # 此时 r.json() 是 str，后续 .get("data") 会炸 'str' object has no attribute 'get'，
+    # 报错完全看不出是哪个接口降级了。这里显式拦截并带上原始 body。
+    if not isinstance(data, dict):
+        raise RuntimeError(
+            f"接口返回非对象: {url} HTTP {r.status_code} "
+            f"type={type(data).__name__} body={str(data)[:200]!r}"
+        )
+    return data
+
+
+def api_post_retry(s, referer: str, url: str, payload: dict | None = None,
+                   attempts: int = 3, delay: float = 0.5) -> dict:
+    """api_post 带重试。
+
+    秒杀是时间窗作业：启动阶段（secConfig/sysTime）单次降级就会让整场作废，
+    而降级响应往往只持续几百毫秒。这里对启动阶段的关键接口做有限重试。
+    """
+    last: Exception | None = None
+    for i in range(1, attempts + 1):
+        try:
+            return api_post(s, referer, url, payload)
+        except Exception as e:
+            last = e
+            if i < attempts:
+                log.warning("接口 %s 第 %d/%d 次失败(%s)，%.1fs 后重试",
+                            url.rsplit("/", 1)[-1], i, attempts, e, delay)
+                time.sleep(delay)
+    raise last  # type: ignore[misc]
 
 
 def server_now_ms(s, referer: str) -> int:
     """服务器当前毫秒时间。实测响应: {"code":"SUCCESS","data":{"sysTime":1790923978566,...}}；
     解析失败时用 Date 响应头兜底（秒级精度）。"""
     try:
-        resp = api_post(s, referer, SYSTIME_URL)
+        resp = api_post_retry(s, referer, SYSTIME_URL)
         ms = (resp.get("data") or {}).get("sysTime")
         if isinstance(ms, int):
             return ms
@@ -106,7 +141,7 @@ def pick_zone(zones: list, now_ms: int) -> tuple[dict | None, bool]:
 
 def ensure_eligible(s, referer: str, cfg: Config) -> bool:
     """秒杀资格 = 完成当日签到。未签则先走同活动的 domark 补签。"""
-    resp = api_post(s, referer, TODAY_MARK_URL)
+    resp = api_post_retry(s, referer, TODAY_MARK_URL)
     if (resp.get("data") or {}).get("markStatus") == "marked":
         return True
     log.info("今日未签到，先补签获取秒杀资格...")
@@ -116,7 +151,7 @@ def ensure_eligible(s, referer: str, cfg: Config) -> bool:
                  result.get("code"), result.get("status"), result.get("msg", ""))
     except Exception as e:
         log.warning("补签请求失败: %s", e)
-    resp = api_post(s, referer, TODAY_MARK_URL)
+    resp = api_post_retry(s, referer, TODAY_MARK_URL)
     return (resp.get("data") or {}).get("markStatus") == "marked"
 
 
@@ -182,10 +217,23 @@ def run(cfg: Config, dry_run: bool, once: bool, at: str | None,
              datetime.fromtimestamp(srv_ms / 1000, TZ_CN).strftime("%m-%d %H:%M:%S.%f")[:-3],
              offset_ms)
 
-    cfg_resp = api_post(s, referer, SECCONFIG_URL)
-    zones = ((cfg_resp.get("data") or {}).get("secKillData") or {}).get("secKillZones") or []
+    cfg_resp = api_post_retry(s, referer, SECCONFIG_URL)
+    # 逐层安全取值：data/secKillData 可能是 None 或非 dict（降级响应），
+    # 直接链式 .get 会炸出无信息 AttributeError。
+    if cfg_resp.get("code") != "SUCCESS":
+        raise RuntimeError(
+            f"secConfig 业务失败: code={cfg_resp.get('code')} msg={cfg_resp.get('msg')} "
+            f"status={cfg_resp.get('status')} raw={json.dumps(cfg_resp, ensure_ascii=False)[:200]}"
+        )
+    data = cfg_resp.get("data")
+    sec_kill_data = data.get("secKillData") if isinstance(data, dict) else None
+    zones = sec_kill_data.get("secKillZones") if isinstance(sec_kill_data, dict) else None
+    zones = zones if isinstance(zones, list) else []
     if not zones:
-        raise RuntimeError("secConfig 未返回任何场次（活动未配置或已结束）")
+        raise RuntimeError(
+            "secConfig 未返回任何场次（活动未配置或已结束）"
+            f" raw_data={json.dumps(data, ensure_ascii=False)[:200]}"
+        )
     log.info("共 %d 个场次:", len(zones))
     for z in zones:
         st = datetime.fromtimestamp(int(z["startTime"]) / 1000, TZ_CN)
@@ -242,6 +290,14 @@ def run(cfg: Config, dry_run: bool, once: bool, at: str | None,
         notify(cfg, "移动秒杀成功 🎉", detail)
         return 0
 
+    # WORK_ORDER_RESTRIC_LIMIT 的服务端 msg 实为"您已领取奖励，限领一次哦"，
+    # 属奖励已领/限领一次的**业务终态**，不是可重试的失败，也不是风控黑名单
+    # （STATUS_MAP 原把它标成"工单限流"是误标）。此状态记日志并退出 0，
+    # 避免每天推"秒杀未成功"污染通知。真实异常(网络/配置)仍正常推。
+    if reason == "WORK_ORDER_RESTRIC_LIMIT":
+        log.info("秒杀跳过: 已领取奖励，限领一次（业务终态，非故障），不再重试")
+        return 0
+
     detail = f"{reason}\n场次 {st.strftime('%m-%d %H:%M')} {zone['prize']['name']}\n手机尾号 {cfg.phone[-4:]}"
     log.warning("秒杀未成功: %s", reason)
     notify(cfg, "移动秒杀未成功", detail)
@@ -277,6 +333,10 @@ def main() -> int:
         log.info("手动中断")
         return 1
     except Exception as e:
+        # secConfig 未返回任何场次 / 没有可参与的场次 = 非节假日无秒杀活动,静默退出,不推送
+        if isinstance(e, RuntimeError) and ("secConfig 未返回任何场次" in str(e) or "没有可参与的场次" in str(e)):
+            log.info("无秒杀场次(非节假日)静默退出: %s", e)
+            return 0
         log.exception("执行失败: %s", e)
         notify(cfg, "移动秒杀异常", f"{e}\n手机尾号 {cfg.phone[-4:] if cfg.phone else '????'}")
         return 1
