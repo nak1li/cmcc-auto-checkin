@@ -32,3 +32,8 @@ scripts/checkin.sh
 scripts/install-launchd.sh
 .cmcc_ticket_cache*.json
 .cmcc_ticket_meta*.json
+# 本地备份与凭证残留
+*.bak
+*.bak-*
+config.json.bak*
+.patches/
